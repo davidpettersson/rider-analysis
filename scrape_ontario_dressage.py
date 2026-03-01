@@ -38,6 +38,15 @@ ONTARIO_KEYWORDS = [
     "dreamcrest",
     "silver dressage championship",  # Silver Championship at Caledon
     "palgrave",
+    "glanbrook",
+    "lda dressage",
+    "lda - virtual dressage",
+    "qslb",
+    "quantum",
+    "queenswood",
+    "stevens creek",
+    "westar",
+    "canyon creek",
     "ontario",
 ]
 
@@ -300,9 +309,20 @@ def main():
         time.sleep(0.3)
 
     # Step 4: Save raw results
-    with open("/home/user/rider-analysis/ontario_dressage_raw_results.json", "w") as f:
+    with open("ontario_dressage_raw_results.json", "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nSaved {len(all_results)} class entries to ontario_dressage_raw_results.json")
+
+    # Step 4b: Save raw results as CSV for Excel pivot tables
+    with open("ontario_dressage_raw_results.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Show ID", "Show Name", "Year", "Date", "Class Name",
+                         "Rider Count", "Competition Level", "Rider Status"])
+        for r in all_results:
+            writer.writerow([r["show_id"], r["show_name"], r["year"], r["date"],
+                             r["class_name"], r["rider_count"], r["comp_level"],
+                             r["rider_status"]])
+    print(f"Saved {len(all_results)} class entries to ontario_dressage_raw_results.csv")
 
     # Step 5: Aggregate and analyze
     print("\n" + "=" * 80)
@@ -374,7 +394,7 @@ def main():
     print(f"\n  OVERALL TOTAL: {overall_total} entries across {sum(len(v) for v in shows_per_year.values())} show-instances")
 
     # Save summary as CSV
-    with open("/home/user/rider-analysis/ontario_dressage_summary.csv", "w", newline="") as f:
+    with open("ontario_dressage_summary.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Year", "Competition Level", "Rider Status", "Entry Count", "Show Count"])
         for year in sorted(summary.keys()):
