@@ -4,42 +4,70 @@ Analysis of dressage show entries in Ontario using data scraped from the [Compet
 
 ## Project Summary
 
-This project scrapes and analyzes Ontario dressage competition entry numbers from CompeteEasy, broken down by **competition level** (Bronze, Silver, Gold) and **rider status** (Junior, Adult Amateur, Open). The full analysis report is in [`analysis_report.md`](analysis_report.md).
+This project scrapes and analyzes Ontario dressage competition data from CompeteEasy. It collects both **class-level summaries** (rider counts by competition level and rider status) and **per-rider detail** (rider names, horse names, scores, and placements), enabling tracking of individual riders across multiple shows.
 
 ## How the Scraping Works
 
-CompeteEasy is an ASP.NET WebForms application. The scraper in `scrape_ontario_dressage.py` uses `requests` + `BeautifulSoup` (no browser/Selenium needed) and works in three stages:
+CompeteEasy is an ASP.NET WebForms application. The scraper in `scrape_ontario_dressage.py` uses `requests` + `BeautifulSoup` (no browser/Selenium needed) and works in two phases:
 
-### 1. Discover all dressage shows
+### Phase 1: Show Discovery & Class-Level Summary (fast, ~2 minutes)
 
-- GET `Equest/Results.aspx` to load the page and capture ASP.NET hidden fields (`__VIEWSTATE`, `__EVENTVALIDATION`, etc.).
-- POST back to the same URL with `eventlist=2` (Dressage discipline) and `rdbSearch=event` (search-by-Show mode). This triggers an ASP.NET postback that populates a `<select id="ddlEvents">` dropdown containing **all dressage shows** (~740 events) with their event IDs and names.
-- Parse all `<option>` elements from that dropdown.
+1. **Discover all dressage shows**: GET `Equest/Results.aspx`, POST back with `eventlist=2` (Dressage) to populate a dropdown of ~740 events with IDs and names.
+2. **Filter for Ontario shows**: Keyword matching on show names using `ONTARIO_KEYWORDS` / `EXCLUDE_KEYWORDS` lists and date filtering to the target year range.
+3. **Scrape show summaries**: For each Ontario show, GET `DressageReport.aspx?EventID={id}`. Each class is in a `div.resultoutbl` wrapper (with a `gotonextpage(classid, eventid)` onclick) containing a `table.resulttbl` with the class name, rider count, and ClassID.
 
-### 2. Filter for Ontario shows
+### Phase 2: Per-Rider Detail (slow, ~8 hours first run)
 
-- The portal has **no province filter on the Results page** (only the Nominate/upcoming-shows page has one). Ontario shows are identified by keyword matching on the show name using two lists:
-  - **`ONTARIO_KEYWORDS`** — known Ontario venues/organizations: Caledon, Angelstone, Dressage Niagara, Kawartha, Centreline Dressage, Wits End, Royal Winter Fair, Dreamcrest, Palgrave, Glanbrook, LDA Dressage, QSLB, Quantum, Queenswood, Stevens Creek, Westar, Canyon Creek, etc.
-  - **`EXCLUDE_KEYWORDS`** — non-Ontario shows that might match broadly: Southlands (BC), ESDCTA/Highthorn/Wild Rose (Alberta), EAADA (Edmonton), MDC (Manitoba), Gingerwood (PEI), etc.
-- Show dates are extracted from the show name string (format `- MM/DD/YYYY` at end of name), then filtered to the target year range.
+4. **Scrape class detail pages**: For each class with a ClassID, GET `NewDressageReportClass.aspx?ClassID={cid}&EventID={eid}` and extract:
+   - Rider name (`input[id^=rider_]`)
+   - Horse name (`input[id^=horse_]`)
+   - Overall score percentage (`span[id*=lblDRGood]`)
+   - Placement (`span[id*=lblDRPlace]`)
+   - Bridle number (`span.numberclass`)
+   - Status — SCR/ELIM/etc. (`input[id*=lblDRStatus]`)
 
-### 3. Scrape individual show results
+### Caching & Resumability
 
-- For each Ontario show, GET `scoreboard/results/Web/DressageReport.aspx?EventID={id}`.
-- This page contains one `<table>` per class, each with two rows: the class name and a "Riders: N" count.
-- Class names encode both competition level and rider status in their prefix codes:
-  - **Competition level**: `BR*` = Bronze, `S*`/`SFEI*` = Silver, `SC*` = Silver Championship, digits/`G*` = Gold, `ON*` = Ontario Championship (Gold), `CA*`/`CAD*` = CADORA, `WSDAC*`/`WS*` = Western Sport Dressage (CADORA equivalent), `HC*`/`NC*` = Non-Competing
-  - **Rider status**: suffix `AA` = Adult Amateur, `JR` = Junior, `OP` = Open, `SR` = Senior (treated as Open), no suffix = Unspecified
+All fetched pages are cached to `cache/` on disk. If the scraper is interrupted, re-running it skips already-cached pages instantly (no delays). Historical results don't change, so the cache has no expiry.
+
+### Organic Browsing Delays
+
+To avoid hammering the server, uncached requests use randomized delays: 2–5s between class pages, 5–10s between shows, and a 15–30s pause every ~50 requests. Cached pages skip all delays.
+
+### Class Name Classification
+
+Class names encode both competition level and rider status in their prefix codes:
+- **Competition level**: `BR*` = Bronze, `S*`/`SFEI*` = Silver, `SC*` = Silver Championship, digits/`G*` = Gold, `ON*` = Ontario Championship (Gold), `CA*`/`CAD*` = CADORA, `WSDAC*`/`WS*` = Western Sport Dressage (CADORA equivalent), `HC*`/`NC*` = Non-Competing
+- **Rider status**: suffix `AA` = Adult Amateur, `JR` = Junior, `OP` = Open, `SR` = Senior (treated as Open), no suffix = Unspecified
+
+## Usage
+
+```bash
+# Full run (phase 1 + phase 2 rider detail)
+uv run python scrape_ontario_dressage.py
+
+# Phase 1 only (show/class discovery, no per-rider detail)
+uv run python scrape_ontario_dressage.py --skip-detail
+
+# Clear cache and re-run from scratch
+uv run python scrape_ontario_dressage.py --clear-cache
+
+# Validate Ontario keywords against the Nominate page
+uv run python validate_ontario_keywords.py
+```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `scrape_ontario_dressage.py` | Main scraping script. Run with `uv run --with requests --with beautifulsoup4 --with lxml python scrape_ontario_dressage.py`. |
+| `scrape_ontario_dressage.py` | Main scraping script (two-phase architecture). |
+| `validate_ontario_keywords.py` | Validates keyword list against CompeteEasy Nominate page (ON + Dressage). |
 | `discover_shows.py` | Discovery script to search CompeteEasy for shows matching specific keywords. |
 | `reviewed-robots-2026-03-01.txt` | robots.txt review confirming no restrictions on scraped endpoints. |
 | `analysis_report.md` | Full analysis report with tables, trends, and findings. |
-| `ontario_dressage_raw_results.json` | Raw class-level data: show ID/name, date, class name, rider count, classified comp level and rider status. |
+| `ontario_dressage_rider_results.csv` | Per-rider detail: one row per rider per class with scores and placements. |
+| `ontario_dressage_raw_results.json` | Raw class-level data with ClassIDs. |
+| `ontario_dressage_raw_results.csv` | Class-level CSV for Excel pivot tables. |
 | `ontario_dressage_summary.csv` | Aggregated CSV: year, competition level, rider status, entry count, show count. |
 
 ## Key Findings (2022-2025)
@@ -54,17 +82,18 @@ CompeteEasy is an ASP.NET WebForms application. The scraper in `scrape_ontario_d
 
 ## Known Limitations & Future Work
 
-- **Ontario identification is heuristic**: shows are matched by name keywords, not by a province field. Some smaller Ontario shows with generic names may be missed; verify against the `ONTARIO_KEYWORDS` list.
+- **Ontario identification is heuristic**: shows are matched by name keywords, not by a province field. Run `validate_ontario_keywords.py` periodically to catch new Ontario show series.
 - **No 2021 data**: CompeteEasy dressage results start in 2022.
-- **"Unspecified" rider status**: ~39% of entries (mostly Gold and CADORA classes) don't have AA/JR/OP suffixes in their class codes, so rider status can't be determined.
-- **Entry counts are class-entries, not unique riders**: one rider entering 3 classes = 3 entries.
-- **Some shows may appear under multiple event IDs** (e.g., separate CDI and national classes at the same venue/weekend). These are counted as separate show instances.
-- To expand coverage, the `ONTARIO_KEYWORDS` and `EXCLUDE_KEYWORDS` lists can be updated as new shows appear on CompeteEasy.
+- **"Unspecified" rider status**: ~39% of entries (mostly Gold and CADORA classes) don't have AA/JR/OP suffixes in their class codes.
+- **Entry counts are class-entries, not unique riders**: one rider entering 3 classes = 3 entries. The rider-level CSV enables deduplication.
+- **Some shows may appear under multiple event IDs** (e.g., separate CDI and national classes at the same venue/weekend).
 
 ## Dependencies
 
-```
-uv run --with requests --with beautifulsoup4 --with lxml python scrape_ontario_dressage.py
-```
+Managed with [uv](https://docs.astral.sh/uv/). Dependencies are declared in `pyproject.toml`:
 
-Or install manually: `pip install requests beautifulsoup4 lxml`. Python 3.8+.
+- `requests`
+- `beautifulsoup4`
+- `lxml`
+
+Python 3.10+.

@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 """
 Scrape CompeteEasy for Ontario dressage show entry data.
-Collects entries by competition level (Bronze/Silver/Gold) and
-rider status (Junior/Adult Amateur/Open) over the last 5 years.
+
+Two-phase architecture:
+  Phase 1 (fast): Discover shows, filter Ontario, get class-level summary
+                  with class names, rider counts, and ClassIDs.
+  Phase 2 (slow): For each class, fetch per-rider detail (placement, score,
+                  rider name, horse name, bridle number, status).
+
+Usage:
+  python scrape_ontario_dressage.py              # Full run (phase 1 + 2)
+  python scrape_ontario_dressage.py --skip-detail # Phase 1 only
+  python scrape_ontario_dressage.py --clear-cache # Clear cache before running
 """
 
-import requests
-from bs4 import BeautifulSoup
-import re
-import json
-import time
+import argparse
 import csv
+import json
+import os
+import random
+import re
+import time
 from collections import defaultdict
 from datetime import datetime
 
+import requests
+from bs4 import BeautifulSoup
+
 BASE_URL = "https://www.competeeasy.com/Equest"
 SCOREBOARD_URL = "https://www.competeeasy.com/scoreboard/results/Web"
+CACHE_DIR = "cache"
 
 session = requests.Session()
 session.headers.update({
@@ -74,6 +88,70 @@ EXCLUDE_KEYWORDS = [
 YEAR_START = 2021
 YEAR_END = 2026  # inclusive of shows in early 2026 if any
 
+# Request counter for organic pauses
+_request_count = 0
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_cache_dir():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _cache_path(prefix, *parts):
+    return os.path.join(CACHE_DIR, f"{prefix}_{'_'.join(str(p) for p in parts)}.html")
+
+
+def _read_cache(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return None
+
+
+def _write_cache(path, content):
+    _ensure_cache_dir()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def clear_cache():
+    """Remove all cached files."""
+    if os.path.exists(CACHE_DIR):
+        for fname in os.listdir(CACHE_DIR):
+            fpath = os.path.join(CACHE_DIR, fname)
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+        print(f"Cleared cache directory: {CACHE_DIR}/")
+
+
+# ---------------------------------------------------------------------------
+# Organic delay helpers
+# ---------------------------------------------------------------------------
+
+def _delay_between_classes():
+    """2-5 second random delay between class page requests."""
+    global _request_count
+    _request_count += 1
+    # Every ~50 requests, take a longer break
+    if _request_count % 50 == 0:
+        pause = random.uniform(15, 30)
+        print(f"    (pausing {pause:.0f}s after {_request_count} requests)")
+        time.sleep(pause)
+    else:
+        time.sleep(random.uniform(2, 5))
+
+
+def _delay_between_shows():
+    """5-10 second random delay between shows."""
+    time.sleep(random.uniform(5, 10))
+
+
+# ---------------------------------------------------------------------------
+# ASP.NET helpers
+# ---------------------------------------------------------------------------
 
 def get_asp_fields(soup):
     """Extract ASP.NET hidden fields for postback."""
@@ -88,6 +166,10 @@ def get_asp_fields(soup):
         fields["ctl00_ctl00_ScriptManager1_HiddenField"] = el.get("value", "")
     return fields
 
+
+# ---------------------------------------------------------------------------
+# Phase 1: Show discovery and class-level summary
+# ---------------------------------------------------------------------------
 
 def get_all_dressage_shows():
     """Get the full list of dressage shows from the Results page."""
@@ -210,52 +292,204 @@ def classify_class_entry(class_name):
     return comp_level, rider_status
 
 
-def scrape_show_results(event_id, event_name):
-    """Scrape the DressageReport page for a show to get class entries."""
+def _fetch_show_page(event_id):
+    """Fetch show summary page, using cache if available.
+
+    Returns (html, from_cache) tuple.
+    """
+    cache = _cache_path("show", event_id)
+    html = _read_cache(cache)
+    if html is not None:
+        return html, True
+
     url = f"{SCOREBOARD_URL}/DressageReport.aspx?EventID={event_id}"
     try:
         resp = session.get(url, timeout=30)
         if resp.status_code != 200:
-            print(f"    HTTP {resp.status_code} for {event_name}")
-            return []
-    except requests.RequestException as e:
-        print(f"    Error fetching {event_name}: {e}")
+            return None, False
+        _write_cache(cache, resp.text)
+        return resp.text, False
+    except requests.RequestException:
+        return None, False
+
+
+def scrape_show_results(event_id, event_name):
+    """
+    Scrape the DressageReport page for a show.
+
+    Returns (classes, from_cache) where classes is a list of dicts with:
+    class_name, rider_count, comp_level, rider_status, class_id.
+    """
+    html, from_cache = _fetch_show_page(event_id)
+    if html is None:
+        print(f"    Failed to fetch {event_name}")
+        return [], False
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # Each class is wrapped in: div.resultoutbl (has onclick) > table.resulttbl
+    classes = []
+    for wrapper in soup.find_all("div", class_="resultoutbl"):
+        table = wrapper.find("table", class_="resulttbl")
+        if not table:
+            continue
+
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+
+        class_name = rows[0].text.strip()
+        rider_text = rows[1].text.strip()
+
+        match = re.search(r'Riders:\s*(\d+)', rider_text)
+        if not match:
+            continue
+
+        rider_count = int(match.group(1))
+        comp_level, rider_status = classify_class_entry(class_name)
+
+        # Extract ClassID from gotonextpage(classid, eventid) on the wrapper div
+        class_id = None
+        onclick = wrapper.get("onclick", "")
+        onclick_match = re.search(r'gotonextpage\(\s*(\d+)', onclick)
+        if onclick_match:
+            class_id = onclick_match.group(1)
+
+        classes.append({
+            "class_name": class_name,
+            "rider_count": rider_count,
+            "comp_level": comp_level,
+            "rider_status": rider_status,
+            "class_id": class_id,
+        })
+
+    return classes, from_cache
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Per-class rider detail scraping
+# ---------------------------------------------------------------------------
+
+def _fetch_class_page(event_id, class_id):
+    """Fetch class detail page, using cache if available.
+
+    Returns (html, from_cache) tuple.
+    """
+    cache = _cache_path("class", event_id, class_id)
+    html = _read_cache(cache)
+    if html is not None:
+        return html, True
+
+    url = f"{SCOREBOARD_URL}/NewDressageReportClass.aspx?ClassID={class_id}&EventID={event_id}"
+    try:
+        resp = session.get(url, timeout=30)
+        if resp.status_code != 200:
+            return None, False
+        _write_cache(cache, resp.text)
+        _delay_between_classes()
+        return resp.text, False
+    except requests.RequestException:
+        return None, False
+
+
+def scrape_class_detail(event_id, class_id):
+    """
+    Fetch per-class detail page and extract per-rider results.
+
+    Returns (riders, from_cache) where riders is a list of dicts with:
+    placement, score, rider_name, horse_name, bridle_number, status.
+    """
+    html, from_cache = _fetch_class_page(event_id, class_id)
+    if html is None:
+        return [], False
+
+    soup = BeautifulSoup(html, "lxml")
+    result_table = soup.find("table", class_="resulttbl")
+    if not result_table:
         return []
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    tables = soup.find_all("table")
+    riders = []
+    rows = result_table.find_all("tr")
+    for row in rows:
+        # Look for rider hidden input — this identifies a rider row
+        rider_input = row.find("input", {"id": re.compile(r'^rider_')})
+        if not rider_input:
+            continue
 
-    classes = []
-    for table in tables:
-        rows = table.find_all("tr")
-        if len(rows) >= 2:
-            # First row has the class name, second has rider count
-            class_name_el = rows[0]
-            rider_count_el = rows[1]
+        rider_name = rider_input.get("value", "").strip()
+        horse_input = row.find("input", {"id": re.compile(r'^horse_')})
+        horse_name = horse_input.get("value", "").strip() if horse_input else ""
 
-            class_name = class_name_el.text.strip()
-            rider_text = rider_count_el.text.strip()
+        # Placement
+        place_el = row.find("span", {"id": re.compile(r'lblDRPlace')})
+        placement = place_el.text.strip() if place_el else ""
 
-            # Extract rider count
-            match = re.search(r'Riders:\s*(\d+)', rider_text)
-            if match:
-                rider_count = int(match.group(1))
-                comp_level, rider_status = classify_class_entry(class_name)
-                classes.append({
-                    "class_name": class_name,
-                    "rider_count": rider_count,
-                    "comp_level": comp_level,
-                    "rider_status": rider_status,
-                })
+        # Score (%)
+        score_el = row.find("span", {"id": re.compile(r'lblDRGood')})
+        score = score_el.text.strip() if score_el else ""
 
-    return classes
+        # Bridle number
+        bridle_el = row.find("span", class_="numberclass")
+        bridle_number = bridle_el.text.strip() if bridle_el else ""
 
+        # Status (SCR, ELIM, etc.)
+        status_el = row.find("input", {"id": re.compile(r'lblDRStatus')})
+        status = status_el.get("value", "").strip() if status_el else ""
+
+        riders.append({
+            "placement": placement,
+            "score": score,
+            "rider_name": rider_name,
+            "horse_name": horse_name,
+            "bridle_number": bridle_number,
+            "status": status,
+        })
+
+    return riders, from_cache
+
+
+# ---------------------------------------------------------------------------
+# Progress / ETA
+# ---------------------------------------------------------------------------
+
+def _format_eta(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    hours = seconds / 3600
+    return f"{hours:.1f}h"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    # Step 1: Get all dressage shows
+    parser = argparse.ArgumentParser(
+        description="Scrape CompeteEasy for Ontario dressage results."
+    )
+    parser.add_argument(
+        "--skip-detail", action="store_true",
+        help="Run phase 1 only (show/class discovery, no per-rider detail)."
+    )
+    parser.add_argument(
+        "--clear-cache", action="store_true",
+        help="Clear the HTTP cache before running."
+    )
+    args = parser.parse_args()
+
+    if args.clear_cache:
+        clear_cache()
+
+    _ensure_cache_dir()
+
+    # -----------------------------------------------------------------------
+    # Phase 1: Show discovery and class-level summary
+    # -----------------------------------------------------------------------
     all_shows = get_all_dressage_shows()
 
-    # Step 2: Filter for Ontario shows in the last 5 years
+    # Filter for Ontario shows in the date range
     ontario_shows = []
     for show in all_shows:
         if not is_ontario_show(show["name"]):
@@ -268,7 +502,6 @@ def main():
             if YEAR_START <= show_date.year <= YEAR_END:
                 ontario_shows.append(show)
         else:
-            # If we can't parse the date, try to extract year from name
             year_match = re.search(r'20(2[1-6])', show["name"])
             if year_match:
                 year = int("20" + year_match.group(1))
@@ -282,12 +515,12 @@ def main():
         date_str = s.get("date", "").strftime("%Y-%m-%d") if s.get("date") else "unknown"
         print(f"  [{s['id']}] {s['name']} (year={s.get('year')}, date={date_str})")
 
-    # Step 3: Scrape each show's results
+    # Scrape class-level summary for each show
     all_results = []
-    total = len(ontario_shows)
+    total_shows = len(ontario_shows)
     for i, show in enumerate(ontario_shows):
-        print(f"\n[{i+1}/{total}] Scraping: {show['name']}")
-        classes = scrape_show_results(show["id"], show["name"])
+        print(f"\n[{i+1}/{total_shows}] Scraping: {show['name']}")
+        classes, from_cache = scrape_show_results(show["id"], show["name"])
         print(f"  Found {len(classes)} classes")
 
         total_riders = sum(c["rider_count"] for c in classes)
@@ -300,38 +533,127 @@ def main():
                 "year": show.get("year"),
                 "date": show.get("date").isoformat() if show.get("date") else None,
                 "class_name": c["class_name"],
+                "class_id": c["class_id"],
                 "rider_count": c["rider_count"],
                 "comp_level": c["comp_level"],
                 "rider_status": c["rider_status"],
             })
 
-        # Be polite to the server
-        time.sleep(0.3)
+        if not from_cache:
+            time.sleep(0.3)
 
-    # Step 4: Save raw results
+    # Save raw results (JSON)
     with open("ontario_dressage_raw_results.json", "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nSaved {len(all_results)} class entries to ontario_dressage_raw_results.json")
 
-    # Step 4b: Save raw results as CSV for Excel pivot tables
+    # Save raw results (CSV — class-level)
     with open("ontario_dressage_raw_results.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Show ID", "Show Name", "Year", "Date", "Class Name",
-                         "Rider Count", "Competition Level", "Rider Status"])
+                         "Class ID", "Rider Count", "Competition Level", "Rider Status"])
         for r in all_results:
             writer.writerow([r["show_id"], r["show_name"], r["year"], r["date"],
-                             r["class_name"], r["rider_count"], r["comp_level"],
-                             r["rider_status"]])
+                             r["class_name"], r["class_id"], r["rider_count"],
+                             r["comp_level"], r["rider_status"]])
     print(f"Saved {len(all_results)} class entries to ontario_dressage_raw_results.csv")
 
-    # Step 5: Aggregate and analyze
+    # -----------------------------------------------------------------------
+    # Phase 2: Per-rider detail scraping
+    # -----------------------------------------------------------------------
+    if not args.skip_detail:
+        # Build list of (show_info, class_info) pairs that have ClassIDs
+        detail_tasks = []
+        for r in all_results:
+            if r["class_id"]:
+                detail_tasks.append(r)
+
+        total_classes = len(detail_tasks)
+        print(f"\n{'='*60}")
+        print(f"Phase 2: Fetching per-rider detail for {total_classes} classes")
+        print(f"{'='*60}")
+
+        rider_results = []
+        phase2_start = time.time()
+        last_fetched_show_id = None
+
+        for idx, r in enumerate(detail_tasks):
+            # Progress + ETA
+            elapsed = time.time() - phase2_start
+            if idx > 0:
+                avg_per_class = elapsed / idx
+                remaining = avg_per_class * (total_classes - idx)
+                eta_str = _format_eta(remaining)
+            else:
+                eta_str = "calculating..."
+
+            # Find show index for display
+            show_classes = [t for t in detail_tasks if t["show_id"] == r["show_id"]]
+            class_num = next(
+                (j + 1 for j, t in enumerate(show_classes) if t["class_id"] == r["class_id"]),
+                "?"
+            )
+            show_class_total = len(show_classes)
+
+            print(
+                f"  [{idx+1}/{total_classes}] {r['show_name'][:50]} "
+                f"(class {class_num}/{show_class_total}) "
+                f"[est. {eta_str} remaining]"
+            )
+
+            # Inter-show delay (only when actually fetching from server)
+            if last_fetched_show_id is not None and r["show_id"] != last_fetched_show_id:
+                _delay_between_shows()
+
+            riders, from_cache = scrape_class_detail(r["show_id"], r["class_id"])
+            if not from_cache:
+                last_fetched_show_id = r["show_id"]
+            for rider in riders:
+                rider_results.append({
+                    "show_id": r["show_id"],
+                    "show_name": r["show_name"],
+                    "year": r["year"],
+                    "date": r["date"],
+                    "class_name": r["class_name"],
+                    "comp_level": r["comp_level"],
+                    "rider_status": r["rider_status"],
+                    "placement": rider["placement"],
+                    "score": rider["score"],
+                    "rider_name": rider["rider_name"],
+                    "horse_name": rider["horse_name"],
+                    "bridle_number": rider["bridle_number"],
+                    "status": rider["status"],
+                })
+
+        # Save rider-level CSV
+        with open("ontario_dressage_rider_results.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Show ID", "Show Name", "Year", "Date", "Class Name",
+                "Competition Level", "Rider Status", "Placement", "Score (%)",
+                "Rider Name", "Horse Name", "Bridle Number", "Status",
+            ])
+            for r in rider_results:
+                writer.writerow([
+                    r["show_id"], r["show_name"], r["year"], r["date"],
+                    r["class_name"], r["comp_level"], r["rider_status"],
+                    r["placement"], r["score"], r["rider_name"],
+                    r["horse_name"], r["bridle_number"], r["status"],
+                ])
+
+        elapsed_total = time.time() - phase2_start
+        print(f"\nSaved {len(rider_results)} rider entries to ontario_dressage_rider_results.csv")
+        print(f"Phase 2 completed in {_format_eta(elapsed_total)}")
+
+    # -----------------------------------------------------------------------
+    # Summary / analysis (same as before)
+    # -----------------------------------------------------------------------
     print("\n" + "=" * 80)
     print("ANALYSIS: Ontario Dressage Entries by Year, Competition Level, and Rider Status")
     print("=" * 80)
 
-    # By year -> comp_level -> rider_status -> total entries
     summary = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    show_counts = defaultdict(int)
+    shows_per_year = defaultdict(set)
 
     for r in all_results:
         year = r["year"]
@@ -339,11 +661,6 @@ def main():
         rider = r["rider_status"]
         count = r["rider_count"]
         summary[year][comp][rider] += count
-        show_counts[year] += 0  # just to track years
-
-    # Count unique shows per year
-    shows_per_year = defaultdict(set)
-    for r in all_results:
         shows_per_year[r["year"]].add(r["show_id"])
 
     comp_levels = ["Bronze", "Silver", "Gold", "CADORA", "Non-Competing", "Unknown"]
@@ -393,7 +710,7 @@ def main():
 
     print(f"\n  OVERALL TOTAL: {overall_total} entries across {sum(len(v) for v in shows_per_year.values())} show-instances")
 
-    # Save summary as CSV
+    # Save summary CSV
     with open("ontario_dressage_summary.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Year", "Competition Level", "Rider Status", "Entry Count", "Show Count"])

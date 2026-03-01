@@ -1,0 +1,10 @@
+[project]
+name = "rider-analysis"
+version = "0.1.0"
+description = "Scrape and analyze Ontario dressage competition data from CompeteEasy"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "beautifulsoup4",
+    "lxml",
+]
